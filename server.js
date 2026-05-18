@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -11,7 +10,7 @@ app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 const chunks = {};
 
-app.get('/', (req, res) => res.json({ status: 'online', server: 'Gilson Supremo', version: '4.5' }));
+app.get('/', (req, res) => res.json({ status: 'online', server: 'Gilson Supremo', version: '5.0' }));
 
 app.post('/chunk', (req, res) => {
   const { key, index, data, total } = req.body;
@@ -32,7 +31,7 @@ app.post('/publish', async (req, res) => {
   fs.writeFileSync(videoPath, buf);
   console.log(`\nPublicando @${username} — ${(buf.length/1024/1024).toFixed(1)} MB`);
   try {
-    const result = await postReel(sessionid, username, caption || '', videoPath);
+    const result = await publishReel(sessionid, username, caption || '', videoPath, buf);
     try { fs.unlinkSync(videoPath); } catch(_) {}
     res.json(result);
   } catch(e) {
@@ -42,179 +41,154 @@ app.post('/publish', async (req, res) => {
   }
 });
 
-// Pega o último post do perfil via API pública
-function getLastPostTime(username, sessionid) {
+function igReq(opts, body) {
   return new Promise((resolve) => {
-    const options = {
-      hostname: 'www.instagram.com',
-      path: `/api/v1/users/web_profile_info/?username=${username}`,
-      method: 'GET',
+    const req = https.request({
+      hostname: opts.host || 'i.instagram.com',
+      port: 443,
+      path: opts.path,
+      method: opts.method || 'POST',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Cookie': `sessionid=${sessionid}`,
-        'X-IG-App-ID': '936619743392459'
+        'User-Agent': 'Instagram 269.0.0.18.75 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 301484483)',
+        'Cookie': `sessionid=${opts.sessionid}`,
+        'X-IG-App-ID': '567067343352427',
+        'X-IG-Capabilities': '3brTvw==',
+        'X-IG-Connection-Type': 'WIFI',
+        'Accept-Language': 'en-US',
+        'Accept-Encoding': 'gzip, deflate',
+        ...(opts.headers || {}),
+        ...(body ? { 'Content-Length': String(Buffer.isBuffer(body) ? body.length : Buffer.byteLength(body)) } : {})
       }
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
+    }, (res) => {
+      const parts = [];
+      res.on('data', c => parts.push(c));
       res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const edges = json?.data?.user?.edge_owner_to_timeline_media?.edges;
-          if (edges && edges.length > 0) {
-            resolve(edges[0].node.taken_at_timestamp);
-          } else resolve(null);
-        } catch(e) { resolve(null); }
+        const raw = Buffer.concat(parts);
+        try { resolve({ status: res.statusCode, data: JSON.parse(raw.toString()) }); }
+        catch(e) { resolve({ status: res.statusCode, data: { _raw: raw.toString().slice(0,300) } }); }
       });
     });
-    req.on('error', () => resolve(null));
+    req.on('error', e => resolve({ status: 0, data: { error: e.message } }));
+    if (body) req.write(body);
     req.end();
   });
 }
 
-async function safeClick(page, texts) {
-  return await page.evaluate((texts) => {
-    const all = [...document.querySelectorAll('button,[role="button"],a,span,div')];
-    for (const el of all) {
-      const t = (el.innerText || el.textContent || '').trim();
-      if (texts.includes(t) && el.click) { el.click(); return t; }
-    }
-    for (const el of [...document.querySelectorAll('*')]) {
-      const label = el.getAttribute('aria-label') || '';
-      if (texts.some(t => label.includes(t)) && el.click) { el.click(); return label; }
-    }
-    return null;
-  }, texts);
+async function getUserInfo(sessionid, username) {
+  const res = await igReq({
+    host: 'www.instagram.com',
+    path: `/api/v1/users/web_profile_info/?username=${username.replace('@','')}`,
+    method: 'GET',
+    sessionid,
+    headers: { 'X-IG-App-ID': '936619743392459' }
+  });
+  console.log('UserInfo:', res.status, JSON.stringify(res.data).slice(0,200));
+  const user = res.data?.data?.user;
+  if (!user) throw new Error('Usuário não encontrado ou sessão inválida');
+  return { userId: user.id, username: user.username };
 }
 
-async function postReel(sessionid, username, caption, videoPath) {
-  let browser;
-  const cleanUsername = username.replace('@','');
+async function publishReel(sessionid, username, caption, videoPath, videoBuf) {
+  // 1. Busca user ID
+  console.log('Buscando informações do usuário...');
+  const { userId } = await getUserInfo(sessionid, username);
+  console.log('User ID:', userId);
 
-  // Pega timestamp do último post ANTES de publicar
-  console.log('Verificando último post antes de publicar...');
-  const postTimeBefore = await getLastPostTime(cleanUsername, sessionid);
-  console.log('Último post antes:', postTimeBefore ? new Date(postTimeBefore*1000).toISOString() : 'nenhum');
+  const upload_id = Date.now().toString();
 
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1280,900']
-    });
+  // 2. Inicia upload do vídeo
+  console.log('Iniciando upload do vídeo...');
+  const ruploadParams = JSON.stringify({
+    upload_id,
+    media_type: 2,
+    upload_media_duration_ms: 15000,
+    upload_media_width: 720,
+    upload_media_height: 1280
+  });
 
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setCookie({ name:'sessionid', value:sessionid, domain:'.instagram.com', path:'/', httpOnly:true, secure:true });
-
-    console.log('Acessando Instagram...');
-    await page.goto('https://www.instagram.com/', { waitUntil:'networkidle2', timeout:40000 });
-    await sleep(4000);
-
-    const loggedIn = await page.evaluate(() => !document.querySelector('input[name="username"]'));
-    if (!loggedIn) throw new Error('Session ID inválido ou expirado');
-    console.log('Logado!');
-
-    await safeClick(page, ['Criar','Create','Nova publicação','New post']);
-    await sleep(2500);
-
-    await safeClick(page, ['Reel','Reels']);
-    await sleep(2000);
-
-    // Encontra input de arquivo
-    let fileInput = null;
-    for (let i = 0; i < 20; i++) {
-      await page.evaluate(() => {
-        document.querySelectorAll('input[type="file"]').forEach(inp => {
-          inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:1px!important;height:1px!important;';
-          inp.removeAttribute('hidden');
-        });
-      });
-      fileInput = await page.$('input[type="file"]');
-      if (fileInput) { console.log(`Input encontrado (tentativa ${i+1})`); break; }
-      await page.evaluate(() => {
-        [...document.querySelectorAll('button,[role="button"],div,span')].forEach(b => {
-          const t = (b.innerText || '').trim();
-          if ((t.includes('Selecionar') || t.includes('Select') || t.includes('computador') || t.includes('computer')) && b.click) b.click();
-        });
-      });
-      await sleep(1000);
+  const uploadRes = await igReq({
+    host: 'www.instagram.com',
+    path: `/rupload_igvideo/${upload_id}`,
+    method: 'POST',
+    sessionid,
+    headers: {
+      'X-Instagram-Rupload-Params': ruploadParams,
+      'X-Entity-Type': 'video/mp4',
+      'X-Entity-Name': upload_id,
+      'X-Entity-Length': String(videoBuf.length),
+      'Offset': '0',
+      'Content-Type': 'application/octet-stream',
     }
+  }, videoBuf);
 
-    if (!fileInput) {
-      await page.evaluate(() => {
-        const inp = document.createElement('input');
-        inp.type = 'file'; inp.id = '__g__'; inp.accept = 'video/*';
-        inp.style.cssText = 'position:fixed;top:0;left:0;z-index:999999;width:1px;height:1px;opacity:0.01;';
-        document.body.appendChild(inp);
-      });
-      fileInput = await page.$('#__g__');
-    }
+  console.log('Upload result:', uploadRes.status, JSON.stringify(uploadRes.data).slice(0,200));
 
-    if (!fileInput) throw new Error('Campo de upload não encontrado');
-
-    console.log('Fazendo upload...');
-    await fileInput.uploadFile(videoPath);
-    console.log('Processando vídeo (20s)...');
-    await sleep(20000);
-
-    // Avança
-    for (let i = 0; i < 5; i++) {
-      const r = await safeClick(page, ['Avançar','Next','Continue','Continuar']);
-      if (r) { console.log(`Avançou: ${r}`); await sleep(3000); }
-    }
-
-    // Legenda
-    if (caption) {
-      try {
-        const el = await page.$('div[contenteditable="true"],textarea');
-        if (el) { await el.click(); await el.type(caption, { delay: 15 }); await sleep(1000); }
-      } catch(_) {}
-    }
-
-    // Compartilha
-    console.log('Compartilhando...');
-    for (let i = 0; i < 5; i++) {
-      const r = await safeClick(page, ['Compartilhar','Share','Publicar','Post','Postar']);
-      if (r) { console.log(`Compartilhou: ${r}`); break; }
-      await sleep(2000);
-    }
-
-    // Aguarda processamento
-    console.log('Aguardando publicação (30s)...');
-    await sleep(30000);
-    await browser.close();
-    browser = null;
-
-    // VERIFICAÇÃO REAL: checa se apareceu novo post no perfil
-    console.log('Verificando se post apareceu no perfil...');
-    let confirmed = false;
-    for (let i = 0; i < 6; i++) {
-      await sleep(5000);
-      const postTimeAfter = await getLastPostTime(cleanUsername, sessionid);
-      console.log(`Verificação ${i+1}: último post = ${postTimeAfter ? new Date(postTimeAfter*1000).toISOString() : 'nenhum'}`);
-      if (postTimeAfter && (!postTimeBefore || postTimeAfter > postTimeBefore)) {
-        confirmed = true;
-        console.log('✅ Post confirmado no perfil!');
-        break;
-      }
-    }
-
-    if (confirmed) {
-      return { success: true, media_id: Date.now().toString(), confirmed: true };
-    } else {
-      // Post pode ter sido feito mas não aparece ainda (delay do Instagram)
-      console.log('⚠️ Post não confirmado no perfil ainda (pode aparecer em breve)');
-      return { success: false, error: 'Reel enviado mas não confirmado no perfil. Verifique o Instagram manualmente.' };
-    }
-
-  } finally {
-    if (browser) { try { await browser.close(); } catch(_) {} }
+  if (uploadRes.status !== 200 && !uploadRes.data?.upload_id) {
+    throw new Error(`Upload falhou (${uploadRes.status}): ${uploadRes.data?.message || uploadRes.data?._raw || 'sem resposta'}`);
   }
+
+  // 3. Aguarda processamento
+  console.log('Aguardando processamento (8s)...');
+  await sleep(8000);
+
+  // 4. Configura como Reel
+  console.log('Configurando como Reel...');
+  const configBody = new URLSearchParams({
+    upload_id,
+    caption,
+    source_type: '4',
+    clips_share_preview_to_feed: '1',
+    _uid: userId,
+    device_id: 'android-' + upload_id.slice(-8)
+  }).toString();
+
+  const configRes = await igReq({
+    host: 'www.instagram.com',
+    path: '/api/v1/clips/share/',
+    method: 'POST',
+    sessionid,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  }, Buffer.from(configBody));
+
+  console.log('Config result:', configRes.status, JSON.stringify(configRes.data).slice(0,300));
+
+  if (configRes.status === 200 && (configRes.data?.status === 'ok' || configRes.data?.media)) {
+    const mediaId = configRes.data?.media?.id || configRes.data?.media?.pk || upload_id;
+    console.log('✅ Reel publicado! Media ID:', mediaId);
+    return { success: true, media_id: mediaId, confirmed: true };
+  }
+
+  // 5. Fallback: configure_to_clips
+  console.log('Tentando configure_to_clips...');
+  const configBody2 = new URLSearchParams({
+    upload_id,
+    caption,
+    source_type: '4',
+    clips_share_preview_to_feed: '1'
+  }).toString();
+
+  const configRes2 = await igReq({
+    host: 'www.instagram.com',
+    path: '/api/v1/media/configure_to_clips/',
+    method: 'POST',
+    sessionid,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  }, Buffer.from(configBody2));
+
+  console.log('Config2 result:', configRes2.status, JSON.stringify(configRes2.data).slice(0,300));
+
+  if (configRes2.status === 200 && (configRes2.data?.status === 'ok' || configRes2.data?.media)) {
+    const mediaId = configRes2.data?.media?.id || configRes2.data?.media?.pk || upload_id;
+    console.log('✅ Reel publicado via fallback! Media ID:', mediaId);
+    return { success: true, media_id: mediaId, confirmed: true };
+  }
+
+  const err = configRes.data?.message || configRes2.data?.message || 
+              configRes.data?.feedback_message || `HTTP ${configRes.status}`;
+  throw new Error(err);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Gilson Supremo v4.5 — porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Gilson Supremo v5.0 — porta ${PORT}`));
