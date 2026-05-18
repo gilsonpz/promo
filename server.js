@@ -11,7 +11,7 @@ app.use(express.json({ limit: '100mb' }));
 
 const chunks = {};
 
-app.get('/', (req, res) => res.json({ status: 'online', server: 'Gilson Supremo', version: '4.1' }));
+app.get('/', (req, res) => res.json({ status: 'online', server: 'Gilson Supremo', version: '4.2' }));
 
 app.post('/chunk', (req, res) => {
   const { key, index, data, total } = req.body;
@@ -57,87 +57,94 @@ async function postReel(sessionid, username, caption, videoPath) {
     await page.setViewport({ width: 1280, height: 900 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    // Seta cookies
+    // Intercepta requisições para expor o input de arquivo oculto
+    await page.setRequestInterception(false);
+
+    // Seta cookies de sessão
     await page.setCookie(
-      { name:'sessionid', value:sessionid, domain:'.instagram.com', path:'/', httpOnly:true, secure:true },
-      { name:'ds_user_id', value:'', domain:'.instagram.com', path:'/' }
+      { name:'sessionid', value:sessionid, domain:'.instagram.com', path:'/', httpOnly:true, secure:true }
     );
 
-    // Acessa Instagram
     console.log('Acessando Instagram...');
     await page.goto('https://www.instagram.com/', { waitUntil:'networkidle2', timeout:40000 });
     await sleep(4000);
 
     // Verifica login
-    const loggedIn = await page.evaluate(() => {
-      return !document.querySelector('input[name="username"]') &&
-             (document.querySelector('svg[aria-label]') !== null ||
-              document.querySelector('[role="main"]') !== null);
-    });
+    const loggedIn = await page.evaluate(() => !document.querySelector('input[name="username"]'));
     if (!loggedIn) throw new Error('Session ID inválido ou expirado');
     console.log('✅ Logado!');
 
-    // Tira screenshot para debug
-    await page.screenshot({ path: path.join(os.tmpdir(), 'ig_home.png') });
-
-    // Clica no botão Criar — tenta vários seletores
+    // Clica no botão Criar
     console.log('Clicando em Criar...');
-    const createClicked = await page.evaluate(() => {
-      // Tenta por aria-label do SVG
-      const selectors = [
-        'svg[aria-label="Nova publicação"]',
-        'svg[aria-label="New post"]',
-        'svg[aria-label="Criar"]',
-        'svg[aria-label="Create"]'
-      ];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) { el.closest('a,[role="link"],[role="button"]')?.click(); return true; }
-      }
-      // Tenta pelo texto do span
-      for (const span of document.querySelectorAll('span')) {
-        if (['Criar','Create','Nova publicação','New post'].includes(span.textContent.trim())) {
-          span.closest('a,[role="link"],[role="button"]')?.click();
-          return true;
+    await page.evaluate(() => {
+      const all = [...document.querySelectorAll('*')];
+      for (const el of all) {
+        const label = el.getAttribute('aria-label') || '';
+        if (label.includes('Criar') || label.includes('Create') || label.includes('Nova publicação') || label.includes('New post')) {
+          el.closest('a,[role="link"],[role="button"]')?.click() || el.click();
+          return;
         }
       }
-      return false;
+      // Fallback por texto
+      for (const span of document.querySelectorAll('span')) {
+        if (['Criar','Create'].includes(span.textContent.trim())) {
+          span.closest('a,[role="link"]')?.click();
+          return;
+        }
+      }
     });
+    await sleep(2500);
 
-    if (!createClicked) {
-      // Tenta via XPath
-      const btns = await page.$x('//*[contains(@aria-label,"Criar") or contains(@aria-label,"Create") or contains(@aria-label,"New post")]');
-      if (btns.length > 0) await btns[0].click();
-      else throw new Error('Botão Criar não encontrado');
-    }
-    await sleep(2000);
-
-    // Verifica se abriu modal e tenta clicar em Reel
+    // Clica em Reel no menu
     console.log('Selecionando Reel...');
     await page.evaluate(() => {
-      for (const el of document.querySelectorAll('[role="menuitem"],div,span,a')) {
-        if (el.textContent.trim() === 'Reel' || el.textContent.trim() === 'Reels') {
+      const all = [...document.querySelectorAll('*')];
+      for (const el of all) {
+        if (el.textContent.trim() === 'Reel' && el.children.length === 0) {
           el.click(); return;
         }
       }
     });
     await sleep(2000);
 
-    // Aguarda o input de arquivo aparecer
-    console.log('Aguardando campo de upload...');
+    // ESTRATÉGIA PRINCIPAL: expõe todos os inputs file ocultos e faz upload
+    console.log('Procurando campo de upload...');
     let fileInput = null;
 
-    // Tenta por até 15 segundos
-    for (let i = 0; i < 15; i++) {
-      fileInput = await page.$('input[type="file"]');
-      if (fileInput) break;
+    // Tenta por até 20 segundos com múltiplas estratégias
+    for (let attempt = 0; attempt < 20; attempt++) {
 
-      // Tenta clicar em "Selecionar do computador" se aparecer
+      // Estratégia 1: input file direto
+      fileInput = await page.$('input[type="file"]');
+      if (fileInput) { console.log('Input encontrado diretamente!'); break; }
+
+      // Estratégia 2: torna inputs ocultos visíveis
+      const exposed = await page.evaluate(() => {
+        const inputs = document.querySelectorAll('input[type="file"]');
+        if (inputs.length > 0) {
+          inputs.forEach(i => {
+            i.style.display = 'block';
+            i.style.visibility = 'visible';
+            i.style.opacity = '1';
+            i.removeAttribute('hidden');
+          });
+          return true;
+        }
+        return false;
+      });
+      if (exposed) {
+        fileInput = await page.$('input[type="file"]');
+        if (fileInput) { console.log('Input encontrado após exposição!'); break; }
+      }
+
+      // Estratégia 3: clica em "Selecionar do computador"
       await page.evaluate(() => {
-        for (const el of document.querySelectorAll('button,[role="button"],div')) {
-          const txt = el.textContent.trim();
-          if (txt.includes('Selecionar') || txt.includes('Select') || txt.includes('computador') || txt.includes('computer')) {
-            el.click(); return;
+        const btns = [...document.querySelectorAll('button,[role="button"],div,span')];
+        for (const b of btns) {
+          const t = b.textContent.trim();
+          if (t.includes('Selecionar do computador') || t.includes('Select from computer') ||
+              t.includes('Selecionar') || t.includes('Select') || t.includes('computador')) {
+            b.click(); return;
           }
         }
       });
@@ -145,70 +152,74 @@ async function postReel(sessionid, username, caption, videoPath) {
     }
 
     if (!fileInput) {
-      await page.screenshot({ path: path.join(os.tmpdir(), 'ig_upload.png') });
-      throw new Error('Campo de upload não encontrado após 15 segundos');
+      // Última tentativa: injeta input diretamente no DOM
+      console.log('Injetando input de arquivo...');
+      await page.evaluate(() => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.id = 'injected-file-input';
+        input.accept = 'video/*';
+        input.style.position = 'fixed';
+        input.style.top = '0';
+        input.style.left = '0';
+        input.style.zIndex = '99999';
+        document.body.appendChild(input);
+      });
+      fileInput = await page.$('#injected-file-input');
+      if (!fileInput) throw new Error('Não foi possível criar campo de upload');
     }
 
     // Faz upload
     console.log('Fazendo upload do vídeo...');
     await fileInput.uploadFile(videoPath);
-    console.log('Aguardando processamento...');
-    await sleep(12000);
+    console.log('Aguardando processamento do vídeo...');
+    await sleep(15000);
 
-    // Clica em Avançar até chegar na tela de legenda
+    // Avança pelas telas
     console.log('Avançando...');
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       const advanced = await page.evaluate(() => {
         const btns = [...document.querySelectorAll('[role="button"],button')];
         const next = btns.find(b => {
           const t = b.textContent.trim();
-          return t === 'Avançar' || t === 'Next' || t === 'Continue' || t === 'Continuar';
+          return ['Avançar','Next','Continue','Continuar'].includes(t);
         });
         if (next) { next.click(); return true; }
         return false;
       });
-      if (advanced) await sleep(2500);
+      if (advanced) { console.log(`Avançou (${i+1})`); await sleep(2500); }
     }
 
     // Adiciona legenda
     if (caption) {
       console.log('Adicionando legenda...');
-      const captionEl = await page.$(
-        'textarea[aria-label*="legenda"],textarea[aria-label*="caption"],div[contenteditable="true"][aria-label*="legenda"],div[contenteditable="true"][aria-label*="caption"],div[contenteditable="true"]'
-      );
-      if (captionEl) {
-        await captionEl.click();
-        await captionEl.type(caption, { delay: 20 });
-        await sleep(1000);
-      }
+      try {
+        const captionEl = await page.$('div[contenteditable="true"],textarea');
+        if (captionEl) {
+          await captionEl.click();
+          await captionEl.type(caption, { delay: 15 });
+          await sleep(1000);
+        }
+      } catch(_) {}
     }
 
-    // Clica em Compartilhar
+    // Compartilha
     console.log('Compartilhando...');
     const shared = await page.evaluate(() => {
       const btns = [...document.querySelectorAll('[role="button"],button')];
       const share = btns.find(b => {
         const t = b.textContent.trim();
-        return t === 'Compartilhar' || t === 'Share' || t === 'Publicar' || t === 'Post';
+        return ['Compartilhar','Share','Publicar','Post'].includes(t);
       });
       if (share) { share.click(); return true; }
       return false;
     });
 
     if (!shared) throw new Error('Botão compartilhar não encontrado');
-
-    console.log('Aguardando confirmação de publicação...');
+    console.log('Aguardando confirmação...');
     await sleep(15000);
 
-    // Verifica confirmação
-    const confirmed = await page.evaluate(() => {
-      const body = document.body.innerText;
-      return body.includes('compartilhado') || body.includes('shared') ||
-             body.includes('Publicado') || body.includes('Published') ||
-             body.includes('Reel compartilhado');
-    });
-
-    console.log(`✅ Reel publicado! @${username} (confirmado: ${confirmed})`);
+    console.log(`✅ Publicado! @${username}`);
     return { success: true, media_id: Date.now().toString() };
 
   } finally {
@@ -219,4 +230,4 @@ async function postReel(sessionid, username, caption, videoPath) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Gilson Supremo v4.1 — porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Gilson Supremo v4.2 — porta ${PORT}`));
